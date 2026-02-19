@@ -442,46 +442,82 @@ function hideUploadUI() {
   document.querySelector('.skip-btn').style.display = 'none';
 }
 
+// ── Normalizar nombre de unidad ───────────────────────────────
+// Convierte "2-505" → "02-505", "3-505" → "03-505", etc.
+// Preserva "M-305B" y similares sin número inicial
+function normalizeUnit(raw) {
+  const s = raw.trim();
+  // Si empieza con dígito(s) seguido de guión: normalizar a 2 dígitos
+  // Ej: "2-505" → "02-505", "06-703" → "06-703" (ya OK)
+  return s.replace(/^(\d+)-/, (_, n) => n.padStart(2, '0') + '-');
+}
+
 // ── File handling ─────────────────────────────────────────────
 function handleFile(file) {
   if (!file) return;
 
-  // Detectar si es Excel por nombre o MIME — pero NO bloqueamos, solo informamos
   const name = file.name.toLowerCase();
-  const mime = file.type;
-  const looksLikeExcel =
-    name.endsWith('.xlsx') || name.endsWith('.xls') ||
-    mime.includes('spreadsheet') || mime.includes('excel') ||
-    mime === 'application/octet-stream'; // iOS a veces envía MIME genérico
+  const isCSV = name.endsWith('.csv') || file.type === 'text/csv' || file.type === 'text/plain';
 
-  if (!looksLikeExcel) {
-    showStatus('⚠️ Tipo de archivo inusual — intentando leer de todas formas...');
-  } else {
-    showStatus('Leyendo archivo...');
-  }
+  showStatus('Leyendo archivo...');
 
   const reader = new FileReader();
-  reader.onload = e => {
-    try {
-      const wb   = XLSX.read(new Uint8Array(e.target.result), { type: 'array', cellDates: true });
-      const ws   = wb.Sheets[wb.SheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false });
+
+  if (isCSV) {
+    // Leer CSV como texto
+    reader.onload = e => {
+      try {
+        const text = e.target.result;
+        // Usar xlsx para parsear CSV también
+        const wb   = XLSX.read(text, { type: 'string', cellDates: true });
+        const ws   = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false });
+        processRows(rows);
+      } catch(err) {
+        showStatus('❌ Error al leer CSV: ' + err.message);
+        console.error(err);
+      }
+    };
+    reader.onerror = () => showStatus('❌ No se pudo leer el archivo.');
+    reader.readAsText(file, 'UTF-8');
+  } else {
+    // Leer como ArrayBuffer (xlsx/xls)
+    reader.onload = e => {
+      try {
+        const wb   = XLSX.read(new Uint8Array(e.target.result), { type: 'array', cellDates: true });
+        const ws   = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false });
+        processRows(rows);
+      } catch(err) {
+        showStatus('❌ Error al leer: ' + err.message);
+        console.error(err);
+      }
+    };
+    reader.onerror = () => showStatus('❌ No se pudo leer el archivo.');
+    reader.readAsArrayBuffer(file);
+  }
+}
+
+function processRows(rows) {
+  try {
       const headers = rows[0];
       const COL = {};
       headers.forEach((h, i) => {
-        if (h === 'Department') COL.dept = i;
-        if (h === 'Property')   COL.prop = i;
-        if (h === 'Task title') COL.task = i;
-        if (h === 'Due date')   COL.due  = i;
+        const hc = (h || '').replace(/^\uFEFF/, '').trim(); // quitar BOM si existe
+        if (hc === 'Department') COL.dept = i;
+        if (hc === 'Property')   COL.prop = i;
+        if (hc === 'Task title') COL.task = i;
+        if (hc === 'Due date')   COL.due  = i;
       });
 
       const newData = {};
       for (let i = 1; i < rows.length; i++) {
         const r = rows[i];
         if (!r[COL.dept] || r[COL.dept] !== 'Cleaning') continue;
-        const prop   = (r[COL.prop] || '').trim();
-        const task   = (r[COL.task] || '').toLowerCase();
-        const dueRaw = r[COL.due];
+        const propRaw = (r[COL.prop] || '').trim();
+        const prop    = normalizeUnit(propRaw); // ← normalizar aquí
+        const task    = (r[COL.task] || '').toLowerCase();
+        const dueRaw  = r[COL.due];
         if (!dueRaw || !prop) continue;
 
         let key;
@@ -497,16 +533,30 @@ function handleFile(file) {
         else if (task.includes('ingreso') && !task.includes('salida')) type = 'ingreso';
 
         if (!newData[key]) newData[key] = [];
-        const exists = newData[key].some(x => x.unit === prop && x.type === type);
-        if (!exists) newData[key].push({ unit: prop, type });
+        // Deduplicar: mismo día + mismo apto normalizado → solo 1 limpieza
+        // Si ya existe turnover, no agregar salida suelta (turnover incluye salida)
+        const exists = newData[key].some(x => x.unit === prop);
+        if (!exists) {
+          newData[key].push({ unit: prop, type });
+        } else if (type === 'turnover') {
+          // Si viene turnover y ya había salida, reemplazar por turnover
+          const idx = newData[key].findIndex(x => x.unit === prop);
+          newData[key][idx].type = 'turnover';
+        }
       }
 
-      // Merge con historial existente
+      // Merge con historial existente — normalizando unidades del historial también
       Object.entries(newData).forEach(([key, tasks]) => {
         if (!allCleanings[key]) allCleanings[key] = [];
+        // Normalizar unidades ya guardadas en historial
+        allCleanings[key] = allCleanings[key].map(x => ({ ...x, unit: normalizeUnit(x.unit) }));
         tasks.forEach(t => {
-          const exists = allCleanings[key].some(x => x.unit === t.unit && x.type === t.type);
-          if (!exists) allCleanings[key].push(t);
+          const existsIdx = allCleanings[key].findIndex(x => x.unit === t.unit);
+          if (existsIdx === -1) {
+            allCleanings[key].push(t);
+          } else if (t.type === 'turnover') {
+            allCleanings[key][existsIdx].type = 'turnover';
+          }
         });
       });
 
@@ -530,13 +580,10 @@ function handleFile(file) {
       setStep(2);
       renderDayPayRows();
       renderPrevPays();
-    } catch(err) {
-      showStatus('❌ Error al leer: ' + err.message);
-      console.error(err);
-    }
-  };
-  reader.onerror = () => showStatus('❌ No se pudo leer el archivo.');
-  reader.readAsArrayBuffer(file);
+  } catch(err) {
+    showStatus('❌ Error al procesar: ' + err.message);
+    console.error(err);
+  }
 }
 
 // ── Holiday detection ─────────────────────────────────────────
